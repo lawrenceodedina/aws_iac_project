@@ -1,0 +1,352 @@
+---
+- hosts: localhost
+  vars:
+        PUBLIC_RT_NAME: Lawrence-publicRT
+        EC2_IMAGE: ami-04d29b6f966df1537
+
+  connection: local
+  tasks:
+
+    - name: Creating a VPC
+      ec2_vpc_net:
+        name: Lawrence-VPC
+        cidr_block: 10.0.0.0/16
+        region: us-east-1
+      register: VPC
+      tags:
+        - create
+
+    - name: Getting VPC id to be used for later
+      set_fact:
+        vpc_id: "{{ VPC.vpc.id }}"
+      tags:
+        - create
+
+# Creating public subntet in VPC
+    - name: Creating public subnet a
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: 10.0.1.0/24
+        region: us-east-1
+        az: us-east-1a
+        tags:
+            Name: Lawrence-Public-1a
+      register: public_subnet_a
+      tags:
+        - create
+
+    - name: Getting public subnet id to be used for route table
+      set_fact:
+        public_id_a: "{{ public_subnet_a.subnet.id }}"
+      tags:
+        - create
+
+# Creating another public subnet in a different  AZ
+    - name: Creating public subnet b
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: 10.0.2.0/24
+        region: us-east-1
+        az: us-east-1b
+        tags:
+          Name: Lawrence-Public-1b
+      register: public_subnet_b
+      tags:
+        - create
+
+    - name: Getting public subnet_id for private subnet a
+      set_fact:
+        public_id_b: "{{ public_subnet_b.subnet.id }}"
+      tags:
+        - create
+# Creating Internet Gateway
+    - name: Create Internet Gateway
+      ec2_vpc_igw:
+        vpc_id: "{{ vpc_id }}"
+        state: present
+        region: us-east-1
+        tags:
+          Name: Lawrence_IGW
+      register: IGW
+      tags:
+        - create
+
+    - name: Getting IGW ID
+      set_fact:
+        igw_id: "{{ IGW.gateway_id }}"
+      tags:
+        - create
+
+# Creating public route table
+    - name: Public Route table
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_id }}"
+        region: us-east-1
+        tags:
+            Name: "{{ PUBLIC_RT_NAME }}"
+        subnets:
+            - "{{ public_id_a }}"
+            - "{{ public_id_b }}"
+        routes:
+            - dest: 0.0.0.0/0
+              gateway_id: "{{ igw_id }}"
+      tags:
+        - create
+
+# Creating Security Group for ELB
+    - name: ELB security Group
+      ec2_group:
+        name: Lawrence ELB SG
+        description: SG for Lawrence ELB
+        vpc_id: "{{ vpc_id }}"
+        region: us-east-1
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80 
+            cidr_ip: 0.0.0.0/0
+      register: ELB_SG
+      tags:
+        - create
+
+    - name: Getting id for ELB Security Group
+      set_fact:
+         elb_sg_id: "{{ ELB_SG.group_id }}"
+      tags:
+        - create
+
+    - name: set subnet variables
+      set_fact:
+        subnet_lists:
+          - "{{ public_id_a }}"
+          - "{{ public_id_b }}"
+      tags:
+        - create
+
+# Creating Security group for ec2 instance
+    - name: Security group for webservers. Opening port 80 and 22
+      ec2_group:
+        name: Webserver-SG
+        description: SG for webservers
+        vpc_id: "{{ vpc_id }}"
+        region: us-east-1
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+      register: web_sg
+      tags:
+        - create
+# Creating keypair for ec2 instance
+    - name: Creating keypair femi
+      ec2_key:
+        name: mykey
+        region: us-east-1
+        wait: yes
+      register: mykey_info
+      tags:
+        - create
+
+    - name: debug
+      debug:
+        msg: "{{ mykey_info }}"
+      tags:
+        - create
+
+    - name: Copy private key to file
+      copy:
+        content: "{{ mykey_info.key.private_key }}"
+        dest: "./loginmykey.pem"
+        mode: 0600
+      when: mykey_info.changed
+      tags:
+        - create
+
+
+# Creating ec2 instance in AZ 1a
+    - name: Creating ec2 instances
+      loop: "{{ subnet_lists }}"
+      ec2:
+        key_name: mykey
+        instance_type: t2.micro
+        image: "{{ EC2_IMAGE }}"
+        assign_public_ip: yes
+        wait: yes
+        count: 1
+        vpc_subnet_id: "{{ item }}"
+        group_id: "{{ web_sg.group_id }}"
+        region: us-east-1
+        count: 1
+        instance_tags:
+          Name: webserver
+      register: web
+      tags:
+        - create
+
+# Using ec2_instance_facts to get public ips based on security group id
+    - name: Getting facts for webserver instances
+      ec2_instance_info:
+        region: us-east-1
+        filters:
+          instance.group-id: "{{ web_sg.group_id }}"
+      register: web_info
+      tags:
+        - create
+
+    - name: filtering out public_ip
+      set_fact:
+        public: "{{ web_info | json_query('instances[*].public_ip_address') }}"
+      tags:
+        - create
+
+    - name: filtering out public_dns
+      set_fact:
+        public_dns: "{{ web_info | json_query('instances[*].public_dns_name') }}"
+      tags:
+        - create
+
+    - name: filtering out instance_id
+      set_fact:
+        ec2_ids: "{{ web_info | json_query('instances[*].instance_id') }}"
+      tags:
+        - create
+
+    - name: Getting ec2 info
+      debug:
+        var: ec2_ids
+      tags:
+        - create
+
+# Adding ec2 ips to inventory file
+    - name: Adding new instance to inventory file
+      add_host:
+        hostname: "{{ item }}"
+        groupname: cool
+      with_items: "{{ public }}"
+      tags:
+        - create
+      
+    
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item }}"
+        port: 22
+        state: started
+      with_items: "{{ public_dns }}"
+      tags:
+        - create
+      
+
+    - name: Hard wait (30 seconds) before SSHing into EC2 instance
+      pause:
+        seconds: 30
+      
+
+- hosts: cool
+  vars:
+    ansible_ssh_private_key_file: "./loginmykey.pem"
+  remote_user: ec2-user
+  become: True
+  tasks:
+     - name: Install httpd
+       yum:
+         name: httpd
+         state: latest
+       tags:
+         - create
+
+     - name: Start httpd
+       service:
+         name: httpd
+         state: started
+         enabled: yes
+       tags:
+         - create
+
+     - name: Add content web content
+       copy:
+         dest: /var/www/html/index.html
+         content: "<h1> This is server private {{ ansible_hostname }} </h2>"
+         mode: 0755
+       tags:
+         - create
+
+- hosts: localhost
+  connection: local
+  tasks:
+
+    - name: Creating target group for elb
+      elb_target_group:
+        name: LawrenceTargetGroup
+        region: us-east-1
+        protocol: http
+        port: 80
+        vpc_id: "{{ vpc_id }}"
+        health_check_protocol: http
+        health_check_path: /
+        successful_response_codes: 200
+        targets:
+          - Id: "{{ ec2_ids[0] }}"
+            Port: 80
+          - Id: "{{ ec2_ids[1] }}"
+            Port: 80
+        state: present
+        wait_timeout: '200'
+      tags:
+        - create
+
+    - name: Creating elb
+      elb_application_lb:
+        name: Lawrence-ELB
+        region: us-east-1
+        security_groups:
+          - "{{ elb_sg_id }}"
+        subnets:
+          - "{{ public_id_a }}"
+          - "{{ public_id_b }}"
+        listeners:
+          - Protocol: HTTP
+            Port: 80
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: LawrenceTargetGroup
+        state: present
+        wait: yes
+      tags: 
+        - create
+     
+# Part of playbook used to DELETE all the services
+# USE command: ansible-playbook <playbook_name> -t delete
+
+    - name: Delete ec2 instances
+      ec2_instance:
+        region: us-east-1
+        state: absent
+        filters:
+          key-name: mykey
+      tags: 
+        - delete
+
+    - name: Delete elb
+      ec2_elb_lb:
+        region: us-east-1
+        name: Lawrence-ELB
+        state: absent
+      tags:
+        - delete
+  
+    - name: Delete target group
+      elb_target_group:
+        region: us-east-1
+        name: LawrenceTargetGroup
+        vpc_id: "{{ vpc_id }}"
+        state: absent
+      tags:
+        - delete
